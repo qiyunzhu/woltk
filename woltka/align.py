@@ -44,7 +44,7 @@ def plain_mapper(fh, fmt=None, n=1000):
     ------
     deque of str
         Query queue.
-    deque of set of str
+    deque of dict of str -> tuple
         Subject(s) queue.
 
     Notes
@@ -72,18 +72,20 @@ def plain_mapper(fh, fmt=None, n=1000):
     for i, line in enumerate(chain(iter(head), fh)):
 
         # parse current alignment line
+        parsed = parser(line)
         try:
-            query, subject = parser(line)[:2]
+            query, subject = parsed[:2]
         except (TypeError, IndexError):
             continue
+        start, end = parsed[4:6] if len(parsed) >= 6 else (None, None)
 
-        # add subject to subject set of the same query Id
+        # add subject to subject set of the same query Id,
+        # keeping track of read indices
         if query == this:
-            subque[-1].add(subject)
+            subque[-1].setdefault(subject, []).append((start, end))
 
         # when query Id changes,
         else:
-
             # line number has reached target
             if i >= target:
 
@@ -100,9 +102,9 @@ def plain_mapper(fh, fmt=None, n=1000):
                 # next target line number
                 target = i + n
 
-            # create new query and subject set pair
+            # create new query and subject map pair
             qry_append(query)
-            sub_append({subject})
+            sub_append({subject: [(start, end)]})
 
             # update current query Id
             this = query

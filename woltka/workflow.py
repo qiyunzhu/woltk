@@ -38,6 +38,7 @@ from .tree import (
 from .ordinal import (
     ordinal_mapper, read_gene_coords, whether_prefix, calc_gene_lens)
 from .table import prep_table, write_table
+from .cover import SortedRangeList
 
 
 def workflow(input_fp:     str,
@@ -80,6 +81,7 @@ def workflow(input_fp:     str,
              add_lineage: bool = False,
              outmap_dir:   str = None,
              outmap_zip:   str = 'gz',
+             outcov_dir:   str = None,
              # performance
              chunk:        int = None,
              cache:        int = 1024,
@@ -131,7 +133,7 @@ def workflow(input_fp:     str,
         mapper, files, samples, input_fmt, demux, trimsub, tree, rankdic,
         namedic if name_as_id else None, root, ranks, rank2dir, outmap_zip,
         uniq, major, above, subok, sizes, unassigned, stratmap, chunk, cache,
-        zippers)
+        zippers, outcov_dir)
 
     # convert counts to fractions
     frac_profiles(data, frac)
@@ -173,7 +175,8 @@ def classify(mapper:  object,
              stratmap:  dict = None,
              chunk:      int = None,
              cache:      int = 1024,
-             zippers:   dict = None) -> dict:
+             zippers:   dict = None,
+             outcov_dir: str = None) -> dict:
     """Core of the classification workflow.
 
     Parameters
@@ -235,6 +238,8 @@ def classify(mapper:  object,
         LRU cache size for classification results at each rank.
     zippers : dict, optional
         External compression programs.
+    outcov_dir : str, optional
+        Write Subject coverage maps to directory.
 
     Returns
     -------
@@ -246,6 +251,7 @@ def classify(mapper:  object,
     Subject(s) of each query are sorted and converted into a tuple, which is
     hashable, a property necessary for subsequent assignment result caching.
     """
+
     data = {x: {} for x in ranks}
 
     # assigners for each rank
@@ -257,6 +263,9 @@ def classify(mapper:  object,
               'major': major and major / 100, 'above': above, 'subok': subok,
               'sizes': sizes, 'unasgd': unasgd, 'rank2dir': rank2dir,
               'outzip': outzip if outzip != 'none' else None}
+
+    # coverage map
+    covers = defaultdict(SortedRangeList) if outcov_dir else None
 
     # current sample Id
     csample = False
@@ -275,17 +284,40 @@ def classify(mapper:  object,
             for qryque, subque in mapper(fh, fmt=fmt, n=chunk):
                 nqry += len(qryque)
 
-                # (optional) strip indices and generate tuples
-                subque = deque(map(tuple, map(sorted, strip_suffix(
-                    subque, trimsub) if trimsub else subque)))
-
                 # (optional) demultiplex and generate per-sample maps
                 rmaps = demultiplex(qryque, subque, samples) if demux else {
                     files[fp] if files else None: (qryque, subque)}
 
+                # (optional) calculate subject coverage
+                if covers is not None:
+                    for sample, rmap in rmaps.items():
+                        for subjects in rmap[1]:
+                            for subject, ranges in subjects.items():
+                                for start, end in ranges:
+                                    if start and end:
+                                        covers[sample, subject].add_range(
+                                            start, end)
+
+                # discard read start / end
+                for sample in rmaps:
+                    # (optional) strip indices and generate tuples
+                    if not trimsub:
+                        rmaps[sample] = (
+                            rmaps[sample][0],
+                            deque(tuple(sorted(x.keys()))
+                                  for x in rmaps[sample][1])
+                        )
+                    else:
+                        rmaps[sample] = (
+                            rmaps[sample][0],
+                            deque(
+                                tuple(sorted([y.rsplit(trimsub, 1)[0]
+                                              for y in x.keys()]))
+                                for x in rmaps[sample][1])
+                        )
+
                 # assign reads at each rank
                 for sample, rmap in rmaps.items():
-
                     # (optional) read strata of current sample into cache
                     if stratmap and sample != csample:
                         kwargs['strata'] = read_strata(
@@ -304,6 +336,23 @@ def classify(mapper:  object,
 
         click.echo(' Done.')
         click.echo(f'  Number of sequences classified: {nqry}.')
+
+    # write coverage maps
+    if outcov_dir:
+        click.echo('Calculating per sample coverage...', nl=False)
+        covmap = {}
+        for (sample, sub), cover in covers.items():
+            cover.compress()
+            covmap.setdefault(sample, {}).setdefault(sub, []).extend(
+                cover.ranges)
+            # TODO: needs a mechanism to merge ranges of different chunks
+        makedirs(outcov_dir, exist_ok=True)
+        for sample in sorted(covmap):
+            with open(join(outcov_dir, f'{sample}.cov'), 'w') as f:
+                for sub, ranges in sorted(covmap[sample].items()):
+                    for start, end in sorted(ranges):
+                        print(sub, start, end, sep='\t', file=f)
+        click.echo(' Done.')
 
     click.echo('Classification completed.')
     return data
@@ -750,6 +799,8 @@ def strip_suffix(subque: list,
     and trim from it to the right end. If not found, the whole subject Id will
     be retained.
     """
+    # for sub, ranges in subque:
+    #     yield sub.rsplit(sep, 1)[0], ranges
     return map(set, map(partial(
         map, lambda x: x.rsplit(sep, 1)[0]), subque))
 
@@ -944,7 +995,7 @@ def assign_readmap(qryque:    list,
                 major=major, above=above, uniq=uniq))
         assigner = assigners[rank]
 
-    # call assigner on suject(s) per query
+    # call assigner on subject(s) per query
     taxque = map(assigner, subque)
 
     # report or drop unassigned
